@@ -2,6 +2,7 @@ from .imports import *
 from .torch_imports import *
 from .core import *
 from .layer_optimizer import *
+from .fp16 import *
 
 def cut_model(m, cut):
     return list(m.children())[:cut] if cut else [m]
@@ -24,29 +25,43 @@ def num_features(m):
         res = num_features(l)
         if res is not None: return res
 
+def torch_item(x): return x.item() if hasattr(x,'item') else x[0]
 
 class Stepper():
-    def __init__(self, m, opt, crit, clip=0, reg_fn=None):
+    def __init__(self, m, opt, crit, clip=0, reg_fn=None, fp16=False, loss_scale=1):
         self.m,self.opt,self.crit,self.clip,self.reg_fn = m,opt,crit,clip,reg_fn
+        self.fp16 = fp16
         self.reset(True)
+        if self.fp16: self.fp32_params = copy_model_to_fp32(m, opt)
+        self.loss_scale = loss_scale
 
     def reset(self, train=True):
         if train: apply_leaf(self.m, set_train_mode)
         else: self.m.eval()
-        if hasattr(self.m, 'reset'): self.m.reset()
+        if hasattr(self.m, 'reset'):
+            self.m.reset()
+            if self.fp16: self.fp32_params = copy_model_to_fp32(self.m, self.opt)
 
     def step(self, xs, y, epoch):
         xtra = []
         output = self.m(*xs)
         if isinstance(output,tuple): output,*xtra = output
-        self.opt.zero_grad()
+        if self.fp16: self.m.zero_grad()
+        else: self.opt.zero_grad() 
         loss = raw_loss = self.crit(output, y)
+        if self.loss_scale != 1: assert(self.fp16); loss = loss*self.loss_scale
         if self.reg_fn: loss = self.reg_fn(output, xtra, raw_loss)
         loss.backward()
+        if self.fp16: update_fp32_grads(self.fp32_params, self.m)
+        if self.loss_scale != 1:
+            for param in self.fp32_params: param.grad.data.div_(self.loss_scale)
         if self.clip:   # Gradient clipping
             nn.utils.clip_grad_norm(trainable_params_(self.m), self.clip)
         self.opt.step()
-        return raw_loss.data[0]
+        if self.fp16: 
+            copy_fp32_to_model(self.m, self.fp32_params)
+            torch.cuda.synchronize()
+        return torch_item(raw_loss.data)
 
     def evaluate(self, xs, y):
         preds = self.m(*xs)
@@ -72,6 +87,8 @@ def fit(model, data, epochs, opt, crit, metrics=None, callbacks=None, stepper=St
        epochs(int): number of epochs
        crit: loss function to optimize. Example: F.cross_entropy
     """
+    all_val = kwargs.pop('all_val') if 'all_val' in kwargs else False
+    sampler = kwargs.pop('sampler') if 'sampler' in kwargs else None
     stepper = stepper(model, opt, crit, **kwargs)
     metrics = metrics or []
     callbacks = callbacks or []
@@ -87,9 +104,11 @@ def fit(model, data, epochs, opt, crit, metrics=None, callbacks=None, stepper=St
         epochs = 1
 
     for epoch in tnrange(epochs, desc='Epoch'):
+        if sampler: sampler.set_epoch(epoch)
         stepper.reset(True)
         t = tqdm(iter(data.trn_dl), leave=False, total=num_batch)
         i = 0
+        if all_val: val_iter = IterBatch(data.val_dl)
         for (*x,y) in t:
             batch_num += 1
             for cb in callbacks: cb.on_batch_begin()
@@ -98,16 +117,18 @@ def fit(model, data, epochs, opt, crit, metrics=None, callbacks=None, stepper=St
             debias_loss = avg_loss / (1 - avg_mom**batch_num)
             t.set_postfix(loss=debias_loss)
             stop=False
-            for cb in callbacks: stop = stop or cb.on_batch_end(debias_loss)
+            los = debias_loss if not all_val else [debias_loss] + validate_next(stepper,metrics, val_iter)
+            for cb in callbacks: stop = stop or cb.on_batch_end(los)
             if stop: return
             if i>num_batch: break
             i += 1
 
-        vals = validate(stepper, data.val_dl, metrics)
-        if epoch == 0: print(layout.format(*names))
-        print_stats(epoch, [debias_loss] + vals)
-        stop=False
-        for cb in callbacks: stop = stop or cb.on_epoch_end(vals)
+        if not all_val:
+            vals = validate(stepper, data.val_dl, metrics)
+            if epoch == 0: print(layout.format(*names))
+            print_stats(epoch, [debias_loss] + vals)
+            stop=False
+            for cb in callbacks: stop = stop or cb.on_epoch_end(vals)
         if stop: break
 
     for cb in callbacks: cb.on_train_end()
@@ -119,18 +140,46 @@ def print_stats(epoch, values, decimals=6):
     values = [epoch] + list(np.round(values, decimals))
     print(layout.format(*values))
 
+class IterBatch():
+    def __init__(self, dl):
+        self.idx = 0
+        self.dl = dl
+        self.iter = iter(dl)
+
+    def __iter__(self): return self
+
+    def next(self):
+        res = next(self.iter)
+        self.idx += 1
+        if self.idx == len(self.dl):
+            self.iter = iter(self.dl)
+            self.idx=0
+        return res
+
+def validate_next(stepper, metrics, val_iter):
+    """Computes the loss on the next minibatch of the validation set."""
+    stepper.reset(False)
+    (*x,y) = val_iter.next()
+    preds,l = stepper.evaluate(VV(x), VV(y))
+    res = [to_np(l)[0]]
+    res += [f(preds.data,y) for f in metrics]
+    stepper.reset(True)
+    return res
+
 def validate(stepper, dl, metrics):
     batch_cnts,loss,res = [],[],[]
     stepper.reset(False)
     for (*x,y) in iter(dl):
-        preds,l = stepper.evaluate(VV(x), VV(y))
-        batch_cnts.append(len(x))
+        y = VV(y)
+        preds,l = stepper.evaluate(VV(x), y)
+        if isinstance(x,list): batch_cnts.append(len(x[0]))
+        else: batch_cnts.append(len(x))
         loss.append(to_np(l))
-        res.append([f(preds.data,y) for f in metrics])
-    return np.average(loss, 0, weights=batch_cnts).tolist() + np.average(np.stack(res), 0, weights=batch_cnts).tolist()
+        res.append([f(preds.data,y.data) for f in metrics])
+    return [np.average(loss, 0, weights=batch_cnts)] + list(np.average(np.stack(res), 0, weights=batch_cnts))
 
 def get_prediction(x):
-    if isinstance(x,(tuple,list)): x=x[0]
+    if is_listy(x): x=x[0]
     return x.data
 
 def predict(m, dl):
@@ -164,7 +213,7 @@ def model_summary(m, input_size):
             summary[m_key] = OrderedDict()
             summary[m_key]['input_shape'] = list(input[0].size())
             summary[m_key]['input_shape'][0] = -1
-            if isinstance(output,(list,tuple)):
+            if is_listy(output):
                 summary[m_key]['output_shape'] = [[-1] + list(o.size())[1:] for o in output]
             else:
                 summary[m_key]['output_shape'] = list(output.size())
@@ -187,7 +236,7 @@ def model_summary(m, input_size):
     hooks = []
     m.apply(register_hook)
 
-    if isinstance(input_size[0], (list, tuple)):
+    if is_listy(input_size[0]):
         x = [to_gpu(Variable(torch.rand(3,*in_size))) for in_size in input_size]
     else: x = [to_gpu(Variable(torch.rand(3,*input_size)))]
     m(*x)
